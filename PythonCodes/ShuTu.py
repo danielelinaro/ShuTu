@@ -1,7 +1,7 @@
 # This is python code for preprocessing microscopic images, including creating tif stacks, sticthing, and autotrace. 
 # The results will be loaded in ShuTu for semi-automatic neuron reconstruction. 
 #
-# Copyright (C) 2014, Dezhe Z. Jin (dzj2@psu.edu), Ting Zhao
+# Copyright (C) 2014, Dezhe Z. Jin (dzj2@psu.edu)
 
 #	This program is free software: you can redistribute it and/or modify
 #   it under the terms of the GNU General Public License as published by
@@ -27,7 +27,7 @@ from scipy.ndimage import gaussian_filter
 from scipy.ndimage.filters import laplace
 from pylab import *
 import xml.etree.ElementTree as ET
-from subprocess import call
+from subprocess import call, check_output
 from collections import OrderedDict
 from llist import dllist	# NOTE: if fails to load, need to install llist, see https://pypi.python.org/pypi/llist/
 
@@ -38,29 +38,39 @@ from llist import dllist	# NOTE: if fails to load, need to install llist, see ht
 
 ### The directory of the library libShuTu.so ####
 
-place='NJ'	# O, office, NJ, SC, MC, mac, J, Janelia
-
-if place == 'MC':
-	dirCodes = '/Users/dezhejin/projects/ShuTu/'		# mac directory for the c library. 
-elif place == 'J':
-	dirCodes='/groups/spruston/home/jind/NeuTuRelease/' # linux directory for the c library.
-elif place == 'NJ':
-	dirCodes = '/home/djin/ShuTu/PythonCodes/'			# ubuntu directory for the c library. 
-elif place == 'O' or place == 'SC':
-	dirCodes = '/home/dezhe/ShuTu/PythonCodes/'			# ubuntu directory for the c library. 
-
+# check the current path for libShuTu.so
+if os.path.isfile("libShuTu.so"):
+	libShuTu = os.getcwd()+'/libShuTu.so'
+elif os.path.isfile(os.path.expanduser("~/ShuTu/libShuTu.so")):
+	libShuTu = os.path.expanduser("~/ShuTu/libShuTu.so")	
+elif os.path.isfile(os.path.expanduser("~/ShuTuUbuntu/libShuTu.so")):
+	libShuTu = os.path.expanduser("~/ShuTuUbuntu/libShuTu.so")	
+elif os.path.isfile(os.path.expanduser("~/ShuTuMac/libShuTu.so")):
+	libShuTu = os.path.expanduser("~/ShuTuMac/libShuTu.so")	
+else:
+	# find the path to libShuTu.so
+	print 'Finding the path to the libary libShuTu.so...(modify ShuTu.py if the path is known to make ShuTu load faster)'
+	libShuTu = [line for line in check_output("find ~ -iname 'libShuTu.so'", shell=True).splitlines()][0]
+# if pathTolibShuTu.so is fixed and known, comment out the line above and uncomment the following line and provide the path. 
+# libShuTu = pathTolibShuTu.so
+print 'path to libShuTu.so = ',libShuTu
 print ' ' 
-print 'Check where these directories are correct:'
-print 'dirCodes (libShuTu.so) = ',dirCodes
-print ' ' 
+
+### Number of processors used for processing image and stitching####
+
+nProc = 1				# number of processors used for parallel computing in images processing 
+						# make sure that the tif stack size * nProc does not exceed the internal memory. Otherwise the created tif will be corrupt. 
+print 'Number of processors used for image processing and stitching: ', nProc
 
 ### Microscopy settings ######
 
-mag = 100				# microscope magnification
+#mag = 100				# microscope magnification
 #mag = 63				# microscope magnification
-microscopeID = 1		# together with mag, this is used to set xyDist (distance between pixels) and zDist (distance between planes) in micron 
-						# 2, Janelia Zeiss
-						# 3, Janelia confocal
+mag = 40				# microscope magnification
+microscopeID = 3			# together with mag, this is used to set xyDist (distance between pixels) and zDist (distance between planes) in micron 
+						# 1, Janelia Zeiss
+						# 2, Janelia confocal
+                                                # 3, ULB confocal
 
 if microscopeID == 1:
 	microscopeName = 'Janelia Zeiss Brightfield Microscope'
@@ -72,6 +82,17 @@ if microscopeID == 1:
 		zDist = 0.5				# micron, pixel distance in z direction
 	else:
 		print 'ERROR: Unkown magnification for ',microscopeName
+elif microscopeID == 2:
+	microscopeName = 'Janelia confocal microscope.'
+	if mag == 63:
+		xyDist = 0.132		# pixel distance in microns in x y plane
+		zDist = 0.5			# pixel distance in microns in z direction
+elif microscopeID == 3:
+	microscopeName = 'ULB confocal microscope.'
+	if mag == 40:
+		xyDist = 0.116		# pixel distance in microns in x y plane
+		zDist = 0.5			# pixel distance in microns in z direction
+		
 	
 print 'Microscope :', microscopeName 
 print 'Magnification = ', mag 
@@ -83,8 +104,6 @@ print ' '
 ### Preprocessing paramaters #### 
 
 sigmaBack = mag*100.0	# in pixels, sigma for substracting the background. 
-nProc = 2				# number of processors used for parallel computing in images processing 
-						# make sure that the tif stack size * nProc does not exceed the internal memory. Otherwise the created tif will be corrupt. 
 						
 #----------------Set working environment--------------------------------------------------------
 #
@@ -93,24 +112,43 @@ nProc = 2				# number of processors used for parallel computing in images proces
 # This will define the following variables. 
 # If the variables are not set correctly, modify setDataSetCurrent() or specify these variables in other ways. 
 
+separator = '-'
 filenameCommonSlice = '' 	# common string in the tif images. Format: filenameCommon + numbers + .tif
 nTiles = 0;					# number of tiles	
 filenameCommon = ''			# common string in the tif stacks to be created	
 overlapList = ''			# list of pairs of overlapping tiles for stitching. The format is [(1,2),(2,3)] 
+
+def getFilenameCommonSlice():	# tries to find the common filename of the slices.
+	global filenameCommonSlice
+	ending = '_ORG.tif'			# The ending of the slices are assumed to be _ORG.tif
+	print 'Finding filenameCommonSlice by searching files ending with ',ending
+	fname = ''
+	for root, dirnames, filenames in os.walk('.'):
+		for filename in fnmatch.filter(filenames, '*'+ending):	
+			fname= os.path.join(root, filename)
+			break
+		if len(fname) > 0:
+			break
+	print fname
+	iid = fname.find('_z')
+	filenameCommonSlice = fname[0:iid]
+	print 'Setting filenameCommonSlice to ', filenameCommonSlice
+	return filenameCommonSlice
 
 def setDataSetCurrent():	# automatically set filenameCommon and load overlapList from file if already exists. 
 	global filenameCommon, overlapList
 	# define filenameCommon to current directory
 	files = glob.glob("*1.tif")
 	if len(files) == 0:
-		print "There are not tif files."
+		print "There are no preprocessed tif files."
+                filenameCommon = getFilenameCommonSlice()
 	else:	
-		filenameCommon = re.split('[0-9]+.tif',files[0])[0]
+		filenameCommon = re.split(separator+'[0-9]+.tif',files[0])[0]
 	if len(filenameCommon) == 0 and len(files)>0:
 		filenameCommon = raw_input('Set the common prefix for the tif stacks. Input: ')	
 	if len(overlapList) == 0:
 		try:
-			datFile = filenameCommon+'StitchCoord.npz'
+			datFile = filenameCommon+separator+'StitchCoord.npz'
 			print 'Loading overlapList from ',datFile
 			res = numpy.load(datFile)
 			overlapList = res['overlapList']
@@ -137,29 +175,12 @@ setDataSetCurrent()
 # assume filename convention is like slides-09_z035m30.tif, i.e. commonname_z(depth)m(tilenumber).tif
 ####
 
-def getFilenameCommonSlice():	# tries to find the common filename of the slices.
-	global filenameCommonSlice
-	ending = '_ORG.tif'			# The ending of the slices are assumed to be _ORG.tif
-	print 'Finding filenameCommonSlice by searching files ending with ',ending
-	fname = ''
-	for root, dirnames, filenames in os.walk('.'):
-		for filename in fnmatch.filter(filenames, '*'+ending):	
-			fname= os.path.join(root, filename)
-			break
-		if len(fname) > 0:
-			break
-	print fname
-	iid = fname.find('_z')
-	filenameCommonSlice = fname[0:iid]
-	print 'Setting filenameCommonSlice to ', filenameCommonSlice
-	return filenameCommonSlice
-
 def findNumberOfTiles(filenameCommonSlice):	
-	files = glob.glob(filenameCommonSlice+'_*'+"m1_ORG.tif")
+	files = glob.glob(filenameCommonSlice+'_*m1_ORG.tif')
 	if len(files) == 0:
-		files = glob.glob(filenameCommonSlice+'_*'+"m01_ORG.tif")		
+		files = glob.glob(filenameCommonSlice+'_*m01_ORG.tif')
 		if len(files) == 0:
-			files = glob.glob(filenameCommonSlice+'_*'+"m001_ORG.tif")
+			files = glob.glob(filenameCommonSlice+'_*m001_ORG.tif')
 			if len(files) == 0:
 				print 'No slice images found with filenameCommonSlice=',filenameCommonSlice	
 				return 0
@@ -174,7 +195,7 @@ def createTifStacksFromSlices():
 	nTiles = findNumberOfTiles(filenameCommonSlice)	
 	if nTiles == 0:
 		getFilenameCommonSlice()	# try to automatically get filenameCommonSlice
-		nTiles = findNumberOfTiles(filenameCommonSlice)			
+		nTiles = findNumberOfTiles(filenameCommonSlice)
 	print 'Number of processors used ',nProc
 	stacks = range(1,nTiles+1)
 	if len(stacks) > 0:		# COMMENT: pool hangs if nProc does not commensurate len(stacks). Need to find a better coding. 
@@ -187,7 +208,9 @@ def createTifStacksFromSlices():
 		print 'The common string of slice filenames is set to ',filenameCommonSlice,'. Check if this is correct.'	
 	# check the created tif stacks. Some may be corrupt due to too large nProc. Recreate these files. 
 	print 'Checking corrupted tif stacks and try to recreate...'
-	files = glob.glob(filenameCommon+'[0-9]*.tif')
+	files = glob.glob(filenameCommon+separator+'[0-9]*.tif')
+	#if len(files) == 0:
+	#	files = glob.glob(filenameCommon+'-[0-9]*.tif')
 	filesizes = [os.stat(fn).st_size for fn in files]
 	mmax = max(filesizes)
 	for ii in range(len(files)):
@@ -210,8 +233,9 @@ def createOneTifStackFromSlices(istack):
 				files = sort(glob.glob(prefix+'*'+suffix))
 				if len(files) == 0:
 					print 'ERROR IN createOneTifStackFromSlices: Cannot locate the tiff slices.'
-					return 0					
-		filenameStack = filenameCommon+'-'+str(istack)+'.tif'
+					return 0	
+									
+		filenameStack = filenameCommon+separator+str(istack)+'.tif'
 		# see if the file exists.
 		fs = glob.glob(filenameStack)
 		if len(fs) > 0:
@@ -219,7 +243,7 @@ def createOneTifStackFromSlices(istack):
 			return 0
 		print 'Creating tiff stack ',filenameStack
 		# load the C program
-		sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+		sfmLib = ctypes.CDLL(libShuTu)
 		# set parameter types
 		sfmLib.createTiffStackFromSlices.argtypes = [ctypes.c_long,ctypes.POINTER(ctypes.c_char_p),ctypes.c_char_p]
 		sfmLib.createTiffStackFromSlices.restype = None
@@ -235,6 +259,48 @@ def createOneTifStackFromSlices(istack):
 		raise e
 		return 0	
 
+# create tiff stack from slices with filenameCommonSlice and suffix specifed. 
+# slice filenames should be filenameCommonSlice_zNUMBERsuffix
+def createOneTifStackFromSlicesFilenameCommonSliceEnding(filenameCommonSlice,suffix):
+	try:
+		print filenameCommonSlice, suffix
+		prefix = filenameCommonSlice+'_z'
+		numWidth = 3
+		files = sort(glob.glob(prefix+'*'+suffix))
+									
+		filenameStack = filenameCommonSlice+'.tif'
+		# see if the file exists.
+		fs = glob.glob(filenameStack)
+		if len(fs) > 0:
+			print filenameStack,'exists. Skip creating.'
+			return 0
+		print 'Creating tiff stack ',filenameStack
+		# load the C program
+		sfmLib = ctypes.CDLL(libShuTu)
+		# set parameter types
+		sfmLib.createTiffStackFromSlices.argtypes = [ctypes.c_long,ctypes.POINTER(ctypes.c_char_p),ctypes.c_char_p]
+		sfmLib.createTiffStackFromSlices.restype = None
+		# call the C function.
+		fpointers = (ctypes.c_char_p*len(files))()
+		for i in range(len(files)):
+			fpointers[i] = files[i]
+		sfmLib.createTiffStackFromSlices(ctypes.c_long(len(files)),fpointers,ctypes.c_char_p(filenameStack))
+		return len(files)
+	except Exception as e:
+		traceback.print_exc()
+		print()
+		raise e
+		return 0	
+
+# rename all tiff files in directory ddr to *_ORG.tif. This is useful if the image names of tiff slices are are not named with _ORG.
+def addORGtoTiffFilenames(ddr):
+	files = sort(glob.glob(ddr+"/*.tif"))
+	for fn in files:
+		fn2 = fn[:-4]+"_ORG.tif"
+		print "renaming ",fn," to ",fn2
+		os.rename(fn,fn2)
+
+
 #-----------Processing image stacks for stitching and images used in ShuTu --------------------------------------
 
 # process all images. 
@@ -247,11 +313,11 @@ def processAllImages(imageType=0,iforce=0):			# if iforce = 0, only process tif 
 		print "Dark field image."
 	else:
 		print ("ERROR: specify imageType = 0 or 1.");
-	files = glob.glob(filenameCommon+'*[0-9].tif')
+	files = glob.glob(filenameCommon+separator+'*[0-9].tif')
 	filenames = []
 	for fn in files:
 		fnsp = fn.split('.')
-		if len(fnsp) > 2:	# do not confuse with some of the Flatten.tif file.
+		if len(fnsp) > 2:	# do not confuse with some of the Proj.tif file.
 			continue
 		filenameBase = fnsp[0]
 		if iforce==0:
@@ -270,15 +336,25 @@ def processAllImages(imageType=0,iforce=0):			# if iforce = 0, only process tif 
 		pool.map(processImage,filenames,chunksize = 1)
 		pool.close()
 		pool.join()
+	# check the created .Proj.tif files. Some may be corrupt due to too large nProc. Re-process these images.  
+	print 'Checking corrupted .Proj.tif files and try to re-process...'
+	files = glob.glob(filenameCommon+separator+'[0-9]*.Proj.tif')
+	filesizes = [os.stat(fn).st_size for fn in files]
+	mmax = max(filesizes)
+	for ii in range(len(files)):
+		if filesizes[ii] < mmax:
+			os.remove(files[ii])
+			filenameBase = files[ii][:len(files[ii])-9]
+			processImage((filenameBase,imageType))
 
 def processImage(params):
 	filenameBase,imageType = params
 	if imageType == 1 and os.path.isfile(filenameBase+".org.tif"):
-		print "The image has been converted to bright field already. If this not the case, delete *.org.tif files."
+		print "The image has been converted to bright field already. If this is not the case, delete *.org.tif files."
 		imageType = 0
 	try:
 		# load the C program
-		sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+		sfmLib = ctypes.CDLL(libShuTu)
 		sfmLib.processImage.argtypes = [ctypes.c_char_p,ctypes.c_long]
 		sfmLib.processImage.restype = None
 		sfmLib.processImage(ctypes.c_char_p(filenameBase),ctypes.c_long(imageType))		
@@ -291,7 +367,7 @@ def saveImageData(filenameBase,im3d,imFlat,imFlatRGB):
 	print 'Saving image data to ',filenameBase+'.dat...'
 	numpy.savez(filenameBase+'.dat',nx=nx,ny=ny,nz=nz)
 	# load the C program
-	sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+	sfmLib = ctypes.CDLL(libShuTu)
 	# set parameter types
 	imFlatRGB  = imFlatRGB.astype(float32)
 	sfmLib.saveImageData.argtypes = [ctypes.c_char_p,ctypes.c_long,ctypes.c_long,ctypes.c_long, \
@@ -312,7 +388,7 @@ def readImageData(filenameBase):
 	imFlat = zeros((nx,ny),dtype='float32')
 	imFlatRGB = zeros(nx*ny*3).astype('float32')
 	# load the C program
-	sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+	sfmLib = ctypes.CDLL(libShuTu)
 	# set parameter types
 	sfmLib.readImageData.argtypes = [ctypes.c_char_p,ctypes.c_long,ctypes.c_long,ctypes.c_long, ctypes.POINTER(ctypes.c_float),ctypes.POINTER(ctypes.c_float),ctypes.POINTER(ctypes.c_float)]
 	sfmLib.readImageData.restype = None
@@ -346,7 +422,7 @@ def createTiffStackFromArray(im3d,filenameBase,iReorder=1):
 	else:
 		print 'The order of the memory order is assumed to be nz, nx, ny.'	
 	# load the C program
-	sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+	sfmLib = ctypes.CDLL(libShuTu)
 	# set parameter types
 	sfmLib.createGrayTiffStackFromFloatArray.argtypes = [ctypes.c_int,ctypes.c_int,ctypes.c_int,ctypes.POINTER(ctypes.c_float),ctypes.c_char_p]
 	sfmLib.createGrayTiffStackFromFloatArray.restype = None
@@ -357,7 +433,7 @@ def checkImageSize(tiffFilename):
 	# query the size of tiff
 	tiffinfo = array([0,0,0,0,0]).astype(int32)
 	# load the C program
-	sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+	sfmLib = ctypes.CDLL(libShuTu)
 	# set parameter types
 	sfmLib.getTiffAttribute.argtypes = [ctypes.c_char_p,ctypes.POINTER(ctypes.c_int)]
 	sfmLib.getTiffAttribute.restype = None
@@ -380,7 +456,7 @@ def loadStacks(tiffFilename,imageType=0):
 		# query the size of tiff
 		tiffinfo = array([0,0,0,0,0]).astype(int32)
 		# load the C program
-		sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+		sfmLib = ctypes.CDLL(libShuTu)
 		# set parameter types
 		sfmLib.getTiffAttribute.argtypes = [ctypes.c_char_p,ctypes.POINTER(ctypes.c_int)]
 		sfmLib.getTiffAttribute.restype = None
@@ -533,7 +609,7 @@ def convertDarkbackgroundToBrightBackground(tiffFilename):
 		# query the size of tiff
 		tiffinfo = array([0,0,0,0,0]).astype(int32)
 		# load the C program
-		sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+		sfmLib = ctypes.CDLL(libShuTu)
 		# set parameter types
 		sfmLib.getTiffAttribute.argtypes = [ctypes.c_char_p,ctypes.POINTER(ctypes.c_int)]
 		sfmLib.getTiffAttribute.restype = None
@@ -619,7 +695,7 @@ def convertDarkbackgroundToBrightBackground(tiffFilename):
 # 	The subsequence lines are alternations of two types. 
 #	first, sequences of adjacent images shifted to the right
 # 	then a pair of images shifted down. 
-# 	specify sequences of adjacent images in with tile id's (eg filenameCommon20.tif, 20 is the id)
+# 	specify sequences of adjacent images in with tile id's (eg filenameCommon-20.tif, 20 is the id)
 # 	first to the right, then down, then the right, then down, etc.
 # 	The sequences should be such that the tile coordinates can be determined uniquely.  
 # 	example
@@ -677,7 +753,7 @@ def gridStitchImages(nrow,ncol,offsetPerc=80):
 	#	ncol+1,ncol+2,...,2*ncol
 	#	...
 	#	..., nrow * ncol
-	nx,ny,nz = checkImageSize(filenameCommon+'1.tif')	
+	nx,ny,nz = checkImageSize(filenameCommon+separator+'1.tif')
 	tileIDs = []
 	tileX = []
 	tileY = []
@@ -699,7 +775,7 @@ def gridStitchImages(nrow,ncol,offsetPerc=80):
 # The subsequence lines are alternations of two types. 
 # first, sequences of adjacent images shifted to the right
 # then a pair of images shifted down. 
-# specify sequences of adjacent images in with tile id's (eg filenameCommon20.tif, 20 is the id)
+# specify sequences of adjacent images in with tile id's (eg filenameCommon-20.tif, 20 is the id)
 # first to the right, then down, then the right, then down, etc.
 # The sequences should be such that the tile coordinates can be determined uniquely.  
 # example
@@ -743,7 +819,7 @@ def tileSequencesStitch(filename = "tileSequences.txt",iplot=0):
 	
 	# probe image dimensions, assume *.Proj.tif have been generated by processing images. 
 	iid = scans[0][0]
-	nx,ny,nz = checkImageSize(filenameCommon+str(iid)+'.Proj.tif')
+	nx,ny,nz = checkImageSize(filenameCommon+separator+str(iid)+'.Proj.tif')
 			
 	tileIDs = []
 	tileX = []
@@ -790,7 +866,7 @@ def tileSequencesStitch(filename = "tileSequences.txt",iplot=0):
 	imFlatCombined = 255 * ones((int(X.max())+nx,int(Y.max())+ny,3))
 	for kk in range(len(tileIDs)-1,-1,-1):
 		ii = tileIDs[kk]
-		imFlat = array(PIL.Image.open(filenameCommon+str(ii)+'.Proj.tif')).astype('uint8')
+		imFlat = array(PIL.Image.open(filenameCommon+separator+str(ii)+'.Proj.tif')).astype('uint8')
 		if len(imFlat.shape) == 3:
 			imFlatCombined[int(X[kk]):int(X[kk])+nx,int(Y[kk]):int(Y[kk])+ny,:] = imFlat
 		else:
@@ -848,7 +924,7 @@ def stitchShiftTiles(tileIDs,tileX,tileY,nx,ny):
 			else:
 				flag = 0	
 			if flag == 1:
-				# add safety margin to the offsetPerc, add 10 more percent. 
+				# add safety margin to the offsetPerc, add 5 more percent. 
 				offsetPerc = max(offsetPerc - 10, 0)
 				ParamsStitch.append((ii,jj,offsetPerc,direct))
 				IJPairs.append((i,j))
@@ -872,7 +948,7 @@ def stitchShiftTiles(tileIDs,tileX,tileY,nx,ny):
 	E = zeros(2*nt+1).astype(int32)			
 	NE = zeros(1).astype(int32)
 	# load the C program
-	sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+	sfmLib = ctypes.CDLL(libShuTu)
 	# set parameter types
 	sfmLib.kruskal.argtypes = [ctypes.c_long,ctypes.c_float, ctypes.POINTER(ctypes.c_float),ctypes.POINTER(ctypes.c_int)]
 	sfmLib.kruskal.restype = None
@@ -909,21 +985,20 @@ def stitchShiftTiles(tileIDs,tileX,tileY,nx,ny):
 				continue
 		if flag == 0:
 			break
-										
 	stitchImages(overlapList = overlapList,iplot=0)	
 	return overlapList
 			 		
 # delete old pairwise stitching results to reclauclate. 
 def DeleteOldStitchingResults():
-	files = glob.glob(filenameCommon+'*.'+filenameCommon+'*.txt')
+	files = glob.glob(filenameCommon+separator+'*.'+filenameCommon+separator+'*.txt')
 	for ff in files:
 		print 'Delete ',ff
 		os.remove(ff)
 				
 def DirectionalPairwiseStitch(ParamsStitch):
 	filenum1,filenum2,offsetPerc,offsetDirection = ParamsStitch
-	filenameBase1 = filenameCommon+str(filenum1)
-	filenameBase2 = filenameCommon+str(filenum2)
+	filenameBase1 = filenameCommon+separator+str(filenum1)
+	filenameBase2 = filenameCommon+separator+str(filenum2)
 	outfile1 = filenameBase1+'.'+filenameBase2+'.txt'
 	outfile2 = filenameBase2+'.'+filenameBase1+'.txt'
 	
@@ -956,7 +1031,7 @@ def DirectionalPairwiseStitch(ParamsStitch):
 	overlapFract = 1 - offsetPerc/100.0	
 	imageType = 0				
 	# load the C program
-	sfmLib = ctypes.CDLL(dirCodes+'libShuTu.so')
+	sfmLib = ctypes.CDLL(libShuTu)
 	sfmLib.DirectionalPairwiseStitchC.argtypes = [ctypes.c_long,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_float,\
 						ctypes.c_long, ctypes.POINTER(ctypes.c_float)]
 	sfmLib.DirectionalPairwiseStitchC.restype = None
@@ -1027,7 +1102,7 @@ def locateConnectionInOverlapList(overlapList,num):
 			print n1, n2
 			
 def manualEditShifts(num1,num2):
-	filename = filenameCommon+str(num1)+'.'+filenameCommon+str(num2)+'.txt'
+	filename = filenameCommon+separator+str(num1)+'.'+filenameCommon+separator+str(num2)+'.txt'
 	call(['pico',filename])
 				
 def writeStitchOffsetToFile(outfile,dx,dy,dz,crr):
@@ -1040,9 +1115,9 @@ def stitchImages(overlapList=overlapList,iplot=0):
 	# This function sticthes the images together, and creates a summary flattened image of the neuron from the stacks.
 	# if the offsets are not computed already, compute them in parallel.
 	for (i,j) in overlapList:
-		filenameBase1 = filenameCommon+str(i)
-		filenameBase2 = filenameCommon+str(j)
-		outfile = filenameCommon+str(i)+'.'+filenameCommon+str(j)+'.txt'
+		filenameBase1 = filenameCommon+separator+str(i)
+		filenameBase2 = filenameCommon+separator+str(j)
+		outfile = filenameCommon+separator+str(i)+'.'+filenameCommon+separator+str(j)+'.txt'
 	# load the offsets from the computed results.
 	sids = []
 	for (i,j) in overlapList:
@@ -1054,9 +1129,9 @@ def stitchImages(overlapList=overlapList,iplot=0):
 	offsets = []
 	for (i,j) in overlapList:
 		sidsAppear[sids.index(i)].append(k); sidsAppear[sids.index(j)].append(k); k += 1
-		filenameBase1 = filenameCommon+str(i)
-		filenameBase2 = filenameCommon+str(j)
-		outfile = filenameCommon+str(i)+'.'+filenameCommon+str(j)+'.txt'
+		filenameBase1 = filenameCommon+separator+str(i)
+		filenameBase2 = filenameCommon+separator+str(j)
+		outfile = filenameCommon+separator+str(i)+'.'+filenameCommon+separator+str(j)+'.txt'
 		print 'Loading previous stitching result from '+outfile
 		# load the result
 		f = open(outfile)
@@ -1082,14 +1157,15 @@ def stitchImages(overlapList=overlapList,iplot=0):
 	# get the dimensions of the stacks. 
 	shapes = []
 	for ii in sids:
-		nx,ny,nz = checkImageSize(filenameCommon+str(ii)+'.tif')
+		nx,ny,nz = checkImageSize(filenameCommon+separator+str(ii)+'.tif')
 		shapes.append((nx,ny,nz))
 	
 	# construct a stitched 2D image
 	imFlatCombined = 255 * ones((int(X.max())+nx,int(Y.max())+ny,3))
 	for kk in range(len(sids)-1,-1,-1):
 		ii = sids[kk]
-		imFlat = array(PIL.Image.open(filenameCommon+str(ii)+'.Proj.tif')).astype('uint8')
+		print 'filename=',filenameCommon+separator+str(ii)+'.Proj.tif'
+		imFlat = array(PIL.Image.open(filenameCommon+separator+str(ii)+'.Proj.tif')).astype('uint8')
 		if len(imFlat.shape) == 3:
 			imFlatCombined[int(X[kk]):int(X[kk])+nx,int(Y[kk]):int(Y[kk])+ny,:] = imFlat
 		else:
@@ -1101,12 +1177,12 @@ def stitchImages(overlapList=overlapList,iplot=0):
 	im = PIL.Image.fromarray(array(imFlatCombined).astype('uint8'))
 	im.save(filenameCommon+'.flatCombined.tif')
 	
-	outFile = filenameCommon+'StitchCoord.npz'
+	outFile = filenameCommon+separator+'StitchCoord.npz'
 	print 'Saving stitch coordinates to ',outFile
 	savez(outFile,X=X,Y=Y,Z=Z,IDs=sids,shapes=shapes,overlapList=overlapList,filenameCommon=filenameCommon)
 	
 	# save the coordiantes into a text file. 
-	outFile = filenameCommon+'StitchCoord.txt'
+	outFile = filenameCommon+separator+'StitchCoord.txt'
 	print 'Saving cooridnates in text format to ',outFile
 	f = open(outFile,'w')
 	f.write(str(len(X))+' '+str(nx)+' '+str(ny)+' '+str(nz)+'\n')
@@ -1125,10 +1201,10 @@ def stitchImages(overlapList=overlapList,iplot=0):
 	tileList = [];	
 	for kk in range(len(sids)-1,-1,-1):
 		ii = sids[kk]
-		tile = {"source": filenameCommon+str(ii)+'.tif', \
+		tile = {"source": filenameCommon+separator+str(ii)+'.tif', \
 			"offset": [Y[kk], X[kk], Z[kk]] , \
 			"size": [int(ny), int(nx), 1], \
-			"image" : filenameCommon+str(ii)+'.Proj.tif'}
+			"image" : filenameCommon+separator+str(ii)+'.Proj.tif'}
 		tileList.append(tile)
 	tileData = dict({"Tiles": tileList})
 	with open(filenameJS, 'w') as f:
@@ -1181,7 +1257,7 @@ def getOverlap(filenameCommon=filenameCommon):
 			else:
 				ys = min(ny-1,y2 - y + offset); ye = y + ny
 			mask[xs:xe,ys:ye] = 0
-		fn = filenameCommon+str(fileIDs[fid])+'.roi.tif'
+		fn = filenameCommon+separator+str(fileIDs[fid])+'.roi.tif'
 		print 'Save mask to ',fn
 		im = PIL.Image.fromarray((mask*255).astype('uint8'))
 		im.save(fn)
@@ -1200,8 +1276,8 @@ def ManualPairwiseSticting(filenum1,filenum2,offsetDirection,offsetPerc=80):
 	# offsetDirection for filenum1 relative to filenum2, 
 	# offsetDirection, 'up', 'down', 'left', 'right'.	
 	# offsetPerc - percent of movement in that direction. 
-	filenameBase1 = filenameCommon+str(filenum1)
-	filenameBase2 = filenameCommon+str(filenum2)
+	filenameBase1 = filenameCommon+separator+str(filenum1)
+	filenameBase2 = filenameCommon+separator+str(filenum2)
 	im3d1,imFlat1,imFlatGRB1 = readImageData(filenameBase1)
 	im3d2,imFlat2,imFlatGRB2 = readImageData(filenameBase2)	
 
@@ -1308,7 +1384,7 @@ def findConnectedXYZ(kk,sids,sidsAppear,overlapList,offsets,flags,X,Y,Z):
 # this can be used for debugging stitching or autotracing programs. 
 def plotProjectionNeuron():
 	# prepare for combining the eigenvalues and edges. 
-	dataFile = filenameCommon+'StitchCoord.npz'
+	dataFile = filenameCommon+separator+'StitchCoord.npz'
 	print 'Loading stitch coordinates from ',dataFile
 	res = numpy.load(dataFile)
 	X = res['X'].astype(int)
@@ -1319,7 +1395,7 @@ def plotProjectionNeuron():
 	imFlatCombined = 255 * ones((int(X.max())+nx,int(Y.max())+ny,3))
 	for kk in range(len(sids)-1,-1,-1):
 		ii = sids[kk]
-		imFlat = array(PIL.Image.open(filenameCommon+str(ii)+'.Proj.tif')).astype('uint8')
+		imFlat = array(PIL.Image.open(filenameCommon+separator+str(ii)+'.Proj.tif')).astype('uint8')
 		if len(imFlat.shape) == 3:
 			imFlat[0,:,:] = 255; imFlat[nx-1,:,:] = 255	# mark border bright for use in shortest path calculation. 
 			imFlat[:,0,:] = 255; imFlat[:,ny-1,:] = 255			
@@ -1368,7 +1444,7 @@ def saveSWC(filenameSave,branches):
 # when fixing problems with z-mismatch in stitching, the constructed swc can be shifted in z. 	
 def zShiftSWCMatch(matchTile):
 	# load the coordinates
-	fn = filenameCommon+'StitchCoord.npz'
+	fn = filenameCommon+separator+'StitchCoord.npz'
 	print 'Loading stitch coordinates from ',fn
 	try:
 		res=numpy.load(fn)
@@ -1768,28 +1844,30 @@ def convertTo3PointSomaAndScale(swcFilename):
 #---Analyze log file----
 #
 #	Analyze log file from ShuTu software for number of operation in tracing neuron. 
-#
+#	logFilename is where the logs are stored.	
+#		startDate ='2016-06-07'	# start time. keep this format, year-month-day
+#		startTime ='17:43:00'	# start time. keep this format, hour:minute:second
+#		endDate ='2016-06-07'	# end time. keep this format, year-month-day
+#		endTime ='18:08:00'		# end time. keep this format, hour:minute:second
+#	If the start date and time are not specified, the last session in the log file is analyzed. 
+
 import datetime
 import time
-def analyzeLogFile():
-	
+import pylab as plt
+def analyzeLogFile(startDate='',startTime='',endDate='',endTime='',logFilename='~/.neutube.z/log.txt'):
+	logFilename = os.path.expanduser(logFilename)
+	print 'reading activity log from ', logFilename
 	# parameters
 	dt = 0.1 # if time between consecutive same actions smaller than this time the are the same action (this is how the log file is generated.
-	iuseStartEndTime = 0	# set to 1 if specifying start and end time.
-	if iuseStartEndTime == 1:
-		startDate ='2016-06-07'	# start time. keep this format, year-month-day
-		startTime ='17:43:00'	# start time. keep this format, hour:minute:second
-		endDate ='2016-06-07'	# start time. keep this format, year-month-day
-		endTime ='18:08:00'	# start time. keep this format, hour:minute:second
+	ts = -1
+	tend = sys.maxint
+	if len(startDate) > 0 and len(startTime) > 0 and len(endDate) > 0 and len(endTime) > 0:
+		iuseStartEndTime = 1
+		print 'Analyzing log from ',startDate,startTime,' to ',endDate,endTime
 		x = time.strptime(startDate+'T'+startTime,'%Y-%m-%dT%H:%M:%S')
 		ts = time.mktime(x)
 		x = time.strptime(endDate+'T'+endTime,'%Y-%m-%dT%H:%M:%S')
 		tend = time.mktime(x)
-	
-	#logFilename = '/home/djin/NeuronReconstructionData/DH_10-9-13_100xredo/DH100913X100-.auto.swc.Edit.log.txt'
-	#logFilename = '/home/djin/NeuronReconstructionData/DH_7-6-13-2_100x/DH070613C2X100-.auto.swc.Edit.log.txt'
-	#logFilename = '/home/djin/NeuronReconstructionData/DH_7-8-13_100x/DH070813100x.auto.swc.Edit.log.txt'
-	logFilename = '/home/djin/.neutube.z/log.txt'
 	
 	editT = []
 	editAct = []
@@ -1812,27 +1890,37 @@ def analyzeLogFile():
 		timestr = line[6:6+19]
 		x = time.strptime(timestr,'%Y-%m-%dT%H:%M:%S')
 		t = time.mktime(x)
-
-		if line.find('Autosave triggered') != -1 and fflag == 0:
-			fflag = 1
+		if ts == -1:
+			ts = t
+	
+		# keep track of autosave times for taking out the idle times. 
+		if line.find('Autosave triggered') != -1 and (t >= ts or t <= tend):
+			if fflag == 0:
+				fflag = 1
+			else:
+				timeAutoSave += t - tt0
 			tt0 = t
-		if line.find('Autosave triggered') == -1 and fflag == 1:
-			timeAutoSave += t - tt0
-			fflag = 0	
-					
+			continue
+		else:
+			fflag = 0			
+						
 		iid = line.find('"')
 		if iid == -1:
 			continue			
-		if iuseStartEndTime == 1 and (t < ts or t > tend):
+		if t < ts or t > tend:
 			continue
+		
 		actstr=line[iid+1:-3]
 		if actstr.find('Start reconstruction:') == 0:
-			if t0 != -1:
-				print 'Another reconstruction started. Stop.'
-				break
 			t0 = t
 			fileana = actstr[30:-3]
 			print 'Analyzing reconstruction of neuron in ',fileana
+			print 'startTime = ',t
+			timeAutoSave = 0
+			editT = []
+			editAct = []
+			editActUnique = []
+			editActC = []
 		if t0 == -1:
 			continue	
 		if t - tt <= dt and previousAct == actstr:
@@ -1872,17 +1960,21 @@ def analyzeLogFile():
 		print '  ',editActCounts[iid],'	',editActUnique[iid]
 		
 	# plot the tally
-	figure(11); clf()
+	plt.figure(11); plt.clf()
 	ys = [10,9,8,7,6,5,4,3,2,1]
 	ainds = list(sind[0:len(ys)])
 	xs = editActCounts[ainds]
-	barh(ys,xs,align='center',height=0.3,color='green')
+	plt.barh(ys,xs,align='center',height=0.3,color='green')
 	for i in range(len(ys)):
-		text(0,ys[i]+0.25,editActUnique[ainds[i]])
-		text(-2,ys[i]-0.15,editActCounts[ainds[i]],horizontalalignment='right') 
-	text(-2,0,sum(editActCounts),horizontalalignment='right')
-	text(0,0,'= Total number of edits')	
-	axis('off')
+		plt.text(0,ys[i]+0.25,editActUnique[ainds[i]])
+		plt.text(-2,ys[i]-0.15,editActCounts[ainds[i]],horizontalalignment='right') 
+	plt.text(-2,0,sum(editActCounts),horizontalalignment='right')
+	plt.text(0,0,'= Total number of edits.')
+	plt.text(-2,-1,"{:4.2f}".format(hh),horizontalalignment='right')
+	plt.text(0,-1,'= Estimated manual time (hours).')
+	
+	plt.axis('off')
+	plt.show()
 
 # number of SWC points added in manual editing phases. 			
 def countAdded():	
@@ -1903,4 +1995,208 @@ def countAdded():
 	print 'Total number of SWC points added = ',numAdded
 	print 'Fraction of added points = ',numAdded*1.0/numSWCPoints
 				
+####-----Analyze morphology--------------------
+#
+# Here are functions for analyinzg morphogy based on scaled SWC file.
+#
+###
+
+def analyzeStructure():
+	
+	swcFilename = filenameCommon + '.scaled.swc'
+	 
+	print 'Analyzing bursting cell ', swcFilename
+	apicalBranches, basalBranches, axonBranches = getBranchedStructure(swcFilename)
+
+	apicalArea, apicalLen, apicalNumBranch, apicalBranchOrders, apicalBranchRadii \
+	= getBranchStats(apicalBranches)	
+	print 'Apical totArea: ',apicalArea,' totLen: ',apicalLen,' numBranch: ',apicalNumBranch
+
+	basalArea, basalLen, basalNumBranch, basalBranchOrders, basalBranchRadii \
+	= getBranchStats(basalBranches)	
+	print 'Basal totArea: ',basalArea,' totLen: ',basalLen,' numBranch: ',basalNumBranch
+
+	axonArea, axonLen, axonNumBranch, axonBranchOrders, axonBranchRadii \
+	= getBranchStats(axonBranches)	
+	print 'Axon totArea: ',axonArea,' totLen: ',axonLen,' numBranch: ',axonNumBranch
+	
+	areaDen = apicalArea + basalArea
+	lenDen = apicalLen + basalLen
+	numBranchDen = apicalNumBranch + basalNumBranch
+
+	print 'Total dendrite area: ',areaDen
+	print 'Total dendrite length:', lenDen
+	print 'Total dendrite number of branches : ',numBranchDen 
+
+def getBranchedStructure(filename):
+	# from a swc scaled file create the branch structure of the neuron. 
+	# the swc should contain annotations of the points, 1, soma, 2, axon, 3, basal dendrite, 4 apical dendrite
+	
+	if filename.find("scaled") == -1:
+		print "The swc file "+filename+" is not scaled. Need a swc file with .scaled.swc"
+		return 
+	linkedPoints = getLinkedPointsFromSWC(filename)
+	nP = len(linkedPoints)
+
+	types = []
+	numCs = []
+	IDInds = {}		
+	for ii in range(nP):
+		pp = linkedPoints[ii]
+		types.append(pp.Type)
+		numCs.append(pp.numConn())
+		IDInds[pp.ID] = ii
+	# check if the types are set 
+	utypes = unique(types)
+	if len(find((utypes < 1) & (utypes > 4))) != 0:
+		print 'The branch types are not set correctly. Reminder, soma 1, axon 2, basal, 3, apical 4'
+		return	
+		
+	# find the starting points for the segments
+	print 'Finding the starting points of axon, apical dendrite and basal dendrite...'
+	axonStartInds = []
+	apicalStartInds = []
+	basalStartInds = []
+	flagUsed = zeros(nP)
+	for ii in range(nP):
+		pp = linkedPoints[ii]
+		if pp.Type == 1:	# soma point
+			flagUsed[ii] = 1
+			continue
+		for id in pp.conn:
+			iid = IDInds[id]
+			if linkedPoints[iid].Type == 1:
+				if pp.Type == 2:
+					axonStartInds.append(ii)
+				elif pp.Type == 3:
+					basalStartInds.append(ii)
+				elif pp.Type == 4:
+					apicalStartInds.append(ii)
+	print 'Number of starting points: axon ',len(axonStartInds), \
+			' apical dendrite ',len(apicalStartInds), 	\
+			' basal dendrite ',len(	basalStartInds)	
+
+	print 'Getting apical dendritic branches ...'
+	apicalBranches  = []
+	for startPointInd in apicalStartInds:
+		branches = []; connections = []
+		getSegment(startPointInd,linkedPoints,IDInds,flagUsed, branches, connections)
+		branchOrders = zeros(len(branches))
+		branchOrders[0] = 1
+		branchParents = zeros(len(branches))
+		branchParents[0] = -1
+		getBranchOrders(0,connections,branchOrders,branchParents)
+		for ii in range(len(branches)):
+			branches[ii] += (branchOrders[ii],branchParents[ii])
+		apicalBranches.append(branches)
+
+	print 'Getting basal dendritic branches ...'
+	basalBranches  = []
+	for startPointInd in basalStartInds:
+		branches = []; connections = []
+		getSegment(startPointInd,linkedPoints,IDInds,flagUsed, branches, connections)
+		branchOrders = zeros(len(branches))
+		branchOrders[0] = 1
+		branchParents = zeros(len(branches))
+		branchParents[0] = -1
+		getBranchOrders(0,connections,branchOrders,branchParents)
+		for ii in range(len(branches)):
+			branches[ii] += (branchOrders[ii],branchParents[ii])
+		basalBranches.append(branches)
+		
+	print 'Getting axon bracnhes ....'
+	axonBranches  = []
+	for startPointInd in axonStartInds:
+		branches = []; connections = []
+		getSegment(startPointInd,linkedPoints,IDInds,flagUsed, branches, connections)
+		branchOrders = zeros(len(branches))
+		branchOrders[0] = 1
+		branchParents = zeros(len(branches))
+		branchParents[0] = -1
+		getBranchOrders(0,connections,branchOrders,branchParents)
+		for ii in range(len(branches)):
+			branches[ii] += (branchOrders[ii],branchParents[ii])
+		axonBranches.append(branches)
+
+	return apicalBranches, basalBranches, axonBranches
+
+def getBranchOrders(startSegNum,connections,branchOrders,branchParents):
+	for cnn in connections:
+		if len(cnn) == 1 or cnn[0] != startSegNum:
+			continue
+		else:
+			for i in range(1,len(cnn)):
+				segNum = cnn[i]
+				branchOrders[segNum] = branchOrders[startSegNum] + 1
+				branchParents[segNum] = startSegNum
+				getBranchOrders(segNum,connections,branchOrders,branchParents)	
+	return
+
+def getBranchStats(Branches):
+	areaTot = 0
+	lenTot = 0
+	numBranches = 0
+	branchOrders = []
+	branchRadii = []
+	for br in Branches:
+		for (aa, ll, rr, bo, pr) in br:	# area, length, mean radius, branch order, branch parent index. 
+			numBranches += 1
+			areaTot += aa
+			lenTot += ll
+			branchOrders.append(bo)
+			branchRadii.append(rr)
+	# average radius for the same order
+	branchRadii = array(branchRadii)
+	brOrder = unique(branchOrders)
+	brRadMean = zeros(len(brOrder))
+	for ii in range(len(brOrder)):
+		ind = find(branchOrders == brOrder[ii])
+		brRadMean[ii] = mean(branchRadii[ind])		
+	return areaTot, lenTot, numBranches, brOrder, brRadMean		
+					
+def getSegment(startPointInd,linkedPoints,IDInds,flagUsed, branches, connections):	# recursive function for getting the branch segments. 
+	br = []
+	id = startPointInd
+	while 1:
+		PP = linkedPoints[id]
+		br.append(id)
+		flagUsed[id] = 1
+		if len(PP.conn) == 1:	# this is the end point.
+			break
+		elif len(PP.conn) == 2: # this is an interior point. 	
+			for kk in PP.conn:
+				kid = IDInds[kk]
+				if flagUsed[kid] == 1:
+					continue
+				else:
+					id = kid
+					break
+		else:	# start of new branches
+			break
+	#compute branch geometry.
+	area = 0
+	length = 0
+	meanRadius = linkedPoints[br[0]].r
+	for ii in range(1,len(br)):
+		i1 = br[ii-1]; 
+		i2 = br[ii];   
+		x1 = linkedPoints[i1].x; y1 = linkedPoints[i1].y; z1 = linkedPoints[i1].z; r1 = linkedPoints[i1].r;
+		x2 = linkedPoints[i2].x; y2 = linkedPoints[i2].y; z2 = linkedPoints[i2].z; r2 = linkedPoints[i2].r;	
+		ll2 = (x2 - x1)*(x2 - x1) + (y2 - y1)*(y2 - y1) + (z2 - z1)*(z2 - z1)
+		length += sqrt(ll2)
+		area += pi * (r1 + r2) * sqrt(ll2 + (r2 - r1)*(r2 - r1))
+		meanRadius += r2
+	meanRadius /= len(br)	
+				
+	brID = len(branches)
+	branches.append((area,length,meanRadius))
+	connIDs = [brID]
+	for kk in PP.conn:
+		kid = IDInds[kk]
+		if flagUsed[kid] == 1:
+				continue
+		bbID = getSegment(kid,linkedPoints,IDInds,flagUsed,branches, connections)	
+		connIDs.append(bbID)
+	connections.append(connIDs)	
+	return brID
 	
